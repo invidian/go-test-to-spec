@@ -114,7 +114,7 @@ func subTests(tests []string, parentName string) []string {
 	subTests := []string{}
 
 	for _, test := range tests {
-		if strings.Contains(test, parentName) && test != parentName {
+		if strings.HasPrefix(test, parentName) && test != parentName {
 			subTests = append(subTests, strings.TrimPrefix(test, parentName+"/"))
 		}
 	}
