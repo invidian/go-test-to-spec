@@ -155,8 +155,11 @@ func groupLinesPerPackage(lines []*testOutputLine) (map[string][]*testOutputLine
 	linesByPackage := map[string][]*testOutputLine{}
 
 	for _, lineRaw := range getFinalLines(lines) {
+		if _, ok := linesByPackage[lineRaw.Package]; !ok {
+			packages = append(packages, lineRaw.Package)
+		}
+
 		linesByPackage[lineRaw.Package] = append(linesByPackage[lineRaw.Package], lineRaw)
-		packages = append(packages, lineRaw.Package)
 	}
 
 	sort.Strings(packages)
