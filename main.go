@@ -12,112 +12,177 @@ import (
 	"github.com/fatih/color"
 )
 
-type line struct {
+// Copy of https://pkg.go.dev/cmd/test2json#hdr-Output_Format format.
+type testOutputLine struct {
 	Test    string `json:"Test"`
 	Package string `json:"Package"`
+	Action  string `json:"Action"`
 }
+
+type testTree struct {
+	name       string
+	action     string
+	subTests   []*testTree
+	parentName string
+}
+
+const (
+	failAction = "fail"
+)
 
 func main() {
 	if err := run(os.Stdin, os.Stdout); err != nil {
-		fmt.Printf("Error occured: %v\n", err)
+		fmt.Fprintf(os.Stderr, "Error occurred: %v\n", err)
 		os.Exit(1)
 	}
 }
 
-func run(input io.Reader, output io.Writer) error {
+func outputToLines(input io.Reader) ([]*testOutputLine, error) {
 	data, err := ioutil.ReadAll(input)
 	if err != nil {
-		return fmt.Errorf("reading input: %w", err)
+		return nil, fmt.Errorf("reading input: %w", err)
 	}
 
 	dataPerLine := strings.Split(string(data), "\n")
 
-	testsByPackage := map[string][]string{}
+	lines := []*testOutputLine{}
 
 	for _, lineRaw := range dataPerLine {
-		line := &line{}
+		line := &testOutputLine{}
 
 		if lineRaw == "" {
 			continue
 		}
 
 		if err := json.Unmarshal([]byte(lineRaw), line); err != nil {
-			return fmt.Errorf("decoding line %q: %w", lineRaw, err)
+			return nil, fmt.Errorf("decoding line %q: %w", lineRaw, err)
 		}
 
 		if line.Test == "" {
 			continue
 		}
 
-		testsByPackage[line.Package] = append(testsByPackage[line.Package], line.Test)
+		lines = append(lines, line)
 	}
 
-	for p, tests := range testsByPackage {
-		uniqueTests := []string{}
-
-		testNames := map[string]struct{}{}
-
-		for _, test := range tests {
-			if _, ok := testNames[test]; !ok {
-				uniqueTests = append(uniqueTests, strings.ReplaceAll(strings.TrimPrefix(test, "Test_"), "_", " "))
-				testNames[test] = struct{}{}
-			}
-		}
-
-		sort.Strings(uniqueTests)
-
-		fmt.Fprintf(output, "%s:\n", p)
-
-		if err := drill(uniqueTests, "  ", output); err != nil {
-			return fmt.Errorf("generating output for package %q: %w", p, err)
-		}
-	}
-
-	return nil
+	return lines, nil
 }
 
-func drill(tests []string, prefix string, output io.Writer) error {
-	red := color.New(color.FgHiBlack)
+func getFinalLines(lines []*testOutputLine) []*testOutputLine {
+	finalLines := []*testOutputLine{}
 
-	for _, test := range topLevelTests(tests) {
-		st := subTests(tests, test)
+	for _, line := range lines {
+		if line.Action == "pass" || line.Action == failAction {
+			finalLines = append(finalLines, line)
+		}
+	}
 
-		if _, err := fmt.Fprintf(output, "%s%s\n", red.Sprintf(prefix), test); err != nil {
-			return fmt.Errorf("writing output: %w", err)
+	return finalLines
+}
+
+func formatName(name string) string {
+	nameWithoutPrefixAndUnderscores := strings.ReplaceAll(strings.TrimPrefix(name, "Test_"), "_", " ")
+
+	if strings.Contains(nameWithoutPrefixAndUnderscores, "/") {
+		return strings.TrimSpace(strings.ReplaceAll(nameWithoutPrefixAndUnderscores, "/", " "))
+	}
+
+	return strings.TrimSpace(nameWithoutPrefixAndUnderscores)
+}
+
+func formatTestTree(trees []*testTree, parentName string) []string {
+	result := []string{}
+
+	for _, test := range trees {
+		output := ""
+
+		normalizedName := formatName(test.name)
+
+		dimmedWhite := color.New(color.FgHiBlack)
+
+		childName := strings.TrimPrefix(normalizedName, parentName)
+
+		switch {
+		case parentName == "" && test.action == failAction:
+			output += color.New(color.FgRed).Sprintf(normalizedName)
+		case parentName == "" && test.action != failAction:
+			output += normalizedName
+		case parentName != "" && test.action == failAction:
+			output += dimmedWhite.Sprintf(parentName)
+			output += color.New(color.FgHiRed).Sprintf(childName)
+		case parentName != "" && test.action != failAction:
+			output += dimmedWhite.Sprintf(parentName)
+			output += childName
 		}
 
-		if len(st) == 0 {
+		result = append(result, output)
+		result = append(result, formatTestTree(test.subTests, normalizedName)...)
+	}
+
+	return result
+}
+
+func linesToTestTrees(lines []*testOutputLine, parentKeys []string) []*testTree {
+	result := []*testTree{}
+
+	for _, line := range lines {
+		splitted := strings.Split(line.Test, "/")
+
+		// Consider only child items, not grand-children etc.
+		if len(splitted) != len(parentKeys)+1 || !strings.HasPrefix(line.Test, strings.Join(parentKeys, "/")) {
 			continue
 		}
 
-		if err := drill(st, prefix+test+" ", output); err != nil {
-			return fmt.Errorf("generating output for subtests: %w", err)
+		result = append(result, &testTree{
+			name:       line.Test,
+			action:     line.Action,
+			parentName: strings.Join(parentKeys, "/"),
+			subTests:   linesToTestTrees(lines, splitted),
+		})
+	}
+
+	// Put failed test cases on top.
+	sort.Slice(result, func(i, j int) bool {
+		return result[i].action == failAction
+	})
+
+	return result
+}
+
+func groupLinesPerPackage(lines []*testOutputLine) (map[string][]*testOutputLine, []string) {
+	packages := []string{}
+
+	linesByPackage := map[string][]*testOutputLine{}
+
+	for _, lineRaw := range getFinalLines(lines) {
+		linesByPackage[lineRaw.Package] = append(linesByPackage[lineRaw.Package], lineRaw)
+		packages = append(packages, lineRaw.Package)
+	}
+
+	sort.Strings(packages)
+
+	return linesByPackage, packages
+}
+
+func run(input io.Reader, output io.Writer) error {
+	lines, err := outputToLines(input)
+	if err != nil {
+		return fmt.Errorf("converting input to lines format: %w", err)
+	}
+
+	linesByPackage, packages := groupLinesPerPackage(getFinalLines(lines))
+
+	for _, p := range packages {
+		fmt.Fprintf(output, "%s:\n", p)
+
+		lines := formatTestTree(linesToTestTrees(linesByPackage[p], []string{}), "")
+
+		for _, line := range lines {
+			fmt.Fprintf(output, "  %s\n", line)
 		}
+
+		fmt.Fprintln(output)
 	}
 
 	return nil
-}
-
-func topLevelTests(tests []string) []string {
-	topLevelTests := []string{}
-
-	for _, test := range tests {
-		if !strings.Contains(test, "/") {
-			topLevelTests = append(topLevelTests, test)
-		}
-	}
-
-	return topLevelTests
-}
-
-func subTests(tests []string, parentName string) []string {
-	subTests := []string{}
-
-	for _, test := range tests {
-		if strings.HasPrefix(test, parentName) && test != parentName {
-			subTests = append(subTests, strings.TrimPrefix(test, parentName+"/"))
-		}
-	}
-
-	return subTests
 }
